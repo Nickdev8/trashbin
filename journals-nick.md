@@ -1,4 +1,4 @@
-# Disco Trashbin — Planning and Electronics Design
+# Disco Trashbin - Planning and Electronics Design
 **Author:** Nick  
 **Time spent:** 5.5 hours
 
@@ -24,7 +24,7 @@ Plan the Arduino system, sensors, motor control, and audio.
 
 
 
-# Disco Trashbin — Main Wooden Frame Build
+# Disco Trashbin - Main Wooden Frame Build
 **Author:** Nick  
 **Time spent:** 6.25 hours
 
@@ -50,7 +50,7 @@ Build a sturdy frame for the trashbin.
 
 
 
-# Disco Trashbin — Shelves, Panels, Internal Mounts
+# Disco Trashbin - Shelves, Panels, Internal Mounts
 **Author:** Nick  
 **Time spent:** 5.75 hours
 
@@ -77,7 +77,7 @@ Create internal structure for electronics and wiring.
 
 
 
-# Disco Trashbin — Arduino Sensors, Motor, Audio
+# Disco Trashbin - Arduino Sensors, Motor, Audio
 **Author:** Nick  
 **Time spent:** 8.0 hours
 
@@ -107,7 +107,7 @@ Here is the [Source Code](https://github.com/Nickdev8/trashbin/blob/main/trashbi
 
 
 
-# Disco Trashbin — Soldering and Power Distribution
+# Disco Trashbin - Soldering and Power Distribution
 **Author:** Nick  
 **Time spent:** 7.5 hours
 
@@ -133,7 +133,7 @@ Permanently wire the electronics.
 
 
 
-# Disco Trashbin — Painting and Finish
+# Disco Trashbin - Painting and Finish
 **Author:** Nick  
 **Time spent:** 5.0 hours
 
@@ -156,7 +156,7 @@ Paint and protect the wooden body.
 
 
 
-# Disco Trashbin — Final Assembly and Mounting
+# Disco Trashbin - Final Assembly and Mounting
 **Author:** Nick  
 **Time spent:** 5.75 hours
 
@@ -180,7 +180,7 @@ Install electronics and hardware into the bin.
 ![](https://hc-cdn.hel1.your-objectstorage.com/s/v3/dd60e2131c776eab9303bd1f67220cb7cd7ee349_tmp_3Achat_3A2025-11-02_3Acmh69pxsq00cop401dxr6jvx8_3A3349b8bd9e253b4b)
 
 
-# Disco Trashbin — Full System Test
+# Disco Trashbin - Full System Test
 **Author:** Nick  
 **Time spent:** 5.0 hours
 
