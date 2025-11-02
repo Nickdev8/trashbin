@@ -18,6 +18,9 @@ Adjust distances, servo limits, or timing at the top of `trashbin.ino` to fit yo
   </a>
 </div>
 
+![](https://hc-cdn.hel1.your-objectstorage.com/s/v3/b55386573d54730f18d3667566d1c0bfb03e3379_tmp_3Achat_3A2025-11-02_3Acmh69pxsq00cop401dxr6jvx8_3Abe51bdcfd019e0ac)
+![](https://hc-cdn.hel1.your-objectstorage.com/s/v3/f65dd19fb92da9e5caa30e232ddb9590c5812d1c_tmp_3Achat_3A2025-11-02_3Acmh69pxsq00cop401dxr6jvx8_3Afb1836f9083d6bc6)
+
 
 <video class="journal-video" controls playsinline style="aspect-ratio: 2160/3840;" src="https://hc-cdn.hel1.your-objectstorage.com/s/v3/cc011139dd6296c27912b7d7d9b3e75693dc8d07_tmp_3Achat_3A2025-11-02_3Acmh69pxsq00cop401dxr6jvx8_3Adb80fe575ddba916"></video>
 <video class="journal-video" controls playsinline style="aspect-ratio: 2160/3840;" src="https://hc-cdn.hel1.your-objectstorage.com/s/v3/378a4e8e3ee834eae5dc67edbf6bcdab10e5cb80_tmp_3Achat_3A2025-11-02_3Acmh69pxsq00cop401dxr6jvx8_3A7c3b90f674708059"></video>
