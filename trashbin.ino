@@ -52,6 +52,7 @@ unsigned long lastServoMoveMs = 0;
 
 // Sensor-trigger single file
 const char *TRIGGER_FILE = "TRIGGER.MP3";
+bool triggerFileAvailable = false;
 
 // Sequence
 const char* SEQ_FILES[] = { "SEQ1.MP3", "SEQ2.MP3", "SEQ3.MP3" };
@@ -164,6 +165,71 @@ void advanceSequenceIfNeeded() {
   }
 }
 
+bool playRandomMp3() {
+  File dir = SD.open("/");
+  if (!dir) {
+    Serial.println(F("Failed to open SD root for random MP3 lookup."));
+    return false;
+  }
+
+  String chosen = "";
+  uint16_t candidates = 0;
+
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+
+    if (!entry.isDirectory()) {
+      String name = String(entry.name());
+      String upper = name;
+      upper.toUpperCase();
+      if (upper.endsWith(".MP3") && upper != "TRIGGER.MP3") {
+        candidates++;
+        if (random(candidates) == 0) {
+          chosen = name;
+        }
+      }
+    }
+    entry.close();
+  }
+  dir.close();
+
+  if (candidates == 0) {
+    Serial.println(F("No alternate MP3 files found on SD."));
+    return false;
+  }
+
+  Serial.print(F("Random MP3 selected: "));
+  Serial.println(chosen);
+
+  if (!musicPlayer.startPlayingFile(chosen.c_str())) {
+    Serial.println(F("Failed to start selected random MP3."));
+    return false;
+  }
+
+  Serial.println(F("Playing random MP3 fallback."));
+  return true;
+}
+
+bool playTriggerOrRandom() {
+  if (triggerFileAvailable) {
+    if (musicPlayer.startPlayingFile(TRIGGER_FILE)) {
+      Serial.println(F("Starting TRIGGER.MP3"));
+      armOutPulseOnPlaybackStart();
+      return true;
+    }
+    Serial.println(F("Failed to play TRIGGER.MP3, falling back to random MP3."));
+    triggerFileAvailable = false;
+  }
+
+  if (playRandomMp3()) {
+    armOutPulseOnPlaybackStart();
+    return true;
+  }
+
+  return false;
+}
+
 // ---- Servo helpers ----
 void triggerServoMove() {
   unsigned long now = millis();
@@ -197,6 +263,11 @@ void serviceServo() {
 }
 
 void setup() {
+  randomSeed(
+    analogRead(A0) ^ analogRead(A1) ^ analogRead(A2) ^
+    analogRead(A3) ^ analogRead(A4) ^ analogRead(A5)
+  );
+
   // OUT pin + LED
   pinMode(OUT_PIN, OUTPUT);
   digitalWrite(OUT_PIN, outPinState);   // start OFF (LOW)
@@ -236,6 +307,13 @@ void setup() {
   musicPlayer.setVolume(20, 20);
   musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT);
   Serial.println(F("Music Maker ready."));
+
+  triggerFileAvailable = SD.exists(TRIGGER_FILE);
+  if (triggerFileAvailable) {
+    Serial.println(F("TRIGGER.MP3 detected on SD."));
+  } else {
+    Serial.println(F("TRIGGER.MP3 not found. Random MP3 fallback enabled."));
+  }
 }
 
 void handleButton() {
@@ -300,11 +378,8 @@ void handleSensors() {
     triggerServoMove();
 
     if (!musicPlayer.playingMusic) {
-      if (!musicPlayer.startPlayingFile(TRIGGER_FILE)) {
-        Serial.println(F("Failed to play TRIGGER.MP3"));
-      } else {
-        Serial.println(F("Starting TRIGGER.MP3… arming OUT pulse"));
-        armOutPulseOnPlaybackStart();
+      if (!playTriggerOrRandom()) {
+        Serial.println(F("No audio track could be started."));
       }
     } else {
       Serial.println(F("Already playing, skipping OUT pulse to keep sync"));
@@ -332,11 +407,8 @@ void handleSerialTrigger() {
 
       // Play TRIGGER.MP3 if not already playing
       if (!musicPlayer.playingMusic) {
-        if (!musicPlayer.startPlayingFile(TRIGGER_FILE)) {
-          Serial.println(F("Failed to play TRIGGER.MP3"));
-        } else {
-          Serial.println(F("Starting TRIGGER.MP3 from serial trigger"));
-          armOutPulseOnPlaybackStart();
+        if (!playTriggerOrRandom()) {
+          Serial.println(F("Serial trigger: no audio track available."));
         }
       } else {
         Serial.println(F("Already playing, skipping OUT pulse to keep sync"));
