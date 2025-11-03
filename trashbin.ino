@@ -4,542 +4,515 @@
 #include <Servo.h>
 #include <string.h>
 
-// ------------ Output ------------
-#define OUT_PIN A1              // ESP32 trigger output (primary)
-#define OUT_PIN_MIRROR A0       // ESP32 trigger output (mirrored)
-
-// ------------ Pins (Music Maker Shield defaults) ------------
+// ---------------------------------------------------------------------------
+// Pin Mapping (Music Maker Shield defaults)
+// ---------------------------------------------------------------------------
 #define MP3_CS     7
 #define MP3_DCS    6
 #define MP3_DREQ   3
 #define SD_CS      4
 
-// ------------ Ultrasonic pins ------------
+// Ultrasonic sensors (HC-SR04 style)
 #define TRIG1_PIN  A2
 #define ECHO1_PIN  A3
 #define TRIG2_PIN  A5
 #define ECHO2_PIN  A4
 
-// ------------ Servo ------------
-#define SERVO_PIN 9
-#define SERVO_HOLD_MS 1000UL
-#define SERVO_MIN     5
-#define SERVO_MAX     30
-#define SERVO_COOLDOWN_MS 0UL  // Temporarily disable cooldown for rapid triggers
+// Outputs
+#define OUT_PIN        A1
+#define OUT_PIN_MIRROR A0
+#define SERVO_PIN      9
 
+// ---------------------------------------------------------------------------
+// Behaviour Tuning
+// ---------------------------------------------------------------------------
+const bool debugMode = false;              // Enable serial-trigger mode
 
+// Distance thresholds (centimetres)
+const float TRIGGER_DISTANCE_CM   = 38.0f; // Object considered "close"
+const float RELEASE_MARGIN_CM     = 8.0f;  // Extra distance to re-arm trigger (hysteresis)
+
+// Confirmation counts
+const uint8_t TRIGGER_CONFIRMATIONS  = 3;  // Samples inside trigger band
+const uint8_t RELEASE_CONFIRMATIONS  = 4;  // Samples fully outside release band
+
+// Sensor timing
+const unsigned long SENSOR_PING_GAP_MS = 60UL;
+const unsigned long SENSOR_TIMEOUT_US  = 6000UL;
+const float MAX_VALID_DISTANCE_CM      = 60.0f;
+
+// Servo behaviour
+const int SERVO_PRESS_DEG     = 5;
+const int SERVO_REST_DEG      = 30;
+const unsigned long SERVO_HOLD_MS     = 900UL;
+const unsigned long SERVO_COOLDOWN_MS = 2500UL;   // Set to 0 for no cooldown
+
+// OUT pin pulse
+const unsigned long OUT_PULSE_WIDTH_MS   = 1000UL;
+const unsigned long OUT_ARM_TIMEOUT_MS   = 350UL;
+
+// Idle track playback
+const char *const IDLE_FILE = "IDLE.MP3";
+const unsigned long IDLE_RETRY_INTERVAL_MS = 10000UL;
+
+// Trigger track
+const char *const TRIGGER_FILE = "TRIGGER.MP3";
+
+// Random playlist
+const uint8_t MAX_RANDOM_TRACKS = 48;
+
+// Misc
+const unsigned long LOOP_DELAY_MS      = 10UL;
+const unsigned long MIN_LOG_SPACING_MS = 250UL;
+
+// ---------------------------------------------------------------------------
+// Global State
+// ---------------------------------------------------------------------------
 Servo triggerServo;
-bool servoActive = false;
-unsigned long servoStartMs = 0;
-unsigned long lastServoMoveMs = 0;
+bool servoActive             = false;
+unsigned long servoStartMs   = 0;
+unsigned long lastServoPress = 0;
 
-// ------------ Behavior ------------
-#define MUTE_INTERVAL_MS 200UL
-#define TRIGGER_CM     20.0f
-#define MAX_VALID_CM   20.0f
-#define TIMEOUT_US     6000UL
-#define PING_GAP_MS  100UL
+bool outPinState        = LOW;
+bool outPulseArmed      = false;
+bool outPulseActive     = false;
+unsigned long outPulseArmMs   = 0;
+unsigned long outPulseStartMs = 0;
 
+Adafruit_VS1053_FilePlayer musicPlayer = Adafruit_VS1053_FilePlayer(
+  MP3_CS, MP3_DCS, MP3_DREQ, SD_CS
+);
 
-// OUT_PIN pulse on music trigger
-#define OUT_PULSE_MS          1000UL
-#define PULSE_ARM_TIMEOUT_MS   300UL
-#define TRIGGER_CONFIRMATIONS     5
-#define TRIGGER_HOLD_MS          0UL
-#define TRIGGER_RELEASE_MARGIN_CM 5.0f
-#define TRIGGER_RELEASE_CONFIRMATIONS 3
-#define MAX_RANDOM_TRACKS        32
+bool triggerTrackAvailable = false;
+bool idleTrackAvailable    = false;
+bool idlePlaying           = false;
+bool idleSuppressed        = false;
+unsigned long idleLastAttemptMs = 0;
 
-// Debug control
-bool debugMode = false;
+unsigned long lastLogMs = 0;
 
-// Sensor-trigger single file
-const char *TRIGGER_FILE = "TRIGGER.MP3";
-bool triggerFileAvailable = false;
-
-// Idle/background audio
-const char *IDLE_FILE = "IDLE.MP3";
-const unsigned long IDLE_INTERVAL_MS = 10000UL;
-bool idleFileAvailable = false;
-bool idlePlaying = false;
-bool idleSuppressed = false;
-unsigned long lastIdleStartMs = 0;
-
-// Random playback state (shuffled per boot, sequential playback)
 char randomTracks[MAX_RANDOM_TRACKS][13];
 uint8_t randomTrackCount = 0;
-uint8_t nextRandomIndex = 0;
+uint8_t randomTrackIndex = 0;
 
-bool isPlayableMp3(const char *name) {
+// Sensor history
+static float lastDistance1 = -1.0f;
+static float lastDistance2 = -1.0f;
+
+// Trigger state machine
+static uint8_t inRangeStreak     = 0;
+static uint8_t releaseStreak     = 0;
+static bool triggerLatched       = false;
+static unsigned long lastSampleMs = 0;
+
+// ---------------------------------------------------------------------------
+// Utility Helpers
+// ---------------------------------------------------------------------------
+static inline bool isPrintableMp3(const char *name) {
   if (!name) return false;
-
-  char upper[13] = {0};
-  uint8_t len = 0;
-  for (; name[len] != '\0' && len < 12; ++len) {
-    char c = name[len];
+  char upper[13];
+  uint8_t i = 0;
+  for (; i < 12 && name[i] != '\0'; ++i) {
+    char c = name[i];
     if (c >= 'a' && c <= 'z') c -= 32;
-    upper[len] = c;
+    upper[i] = c;
   }
-  upper[len] = '\0';
-
-  if (len < 4) return false;
-  if (upper[len - 4] != '.' || upper[len - 3] != 'M' || upper[len - 2] != 'P' || upper[len - 1] != '3') {
-    return false;
-  }
+  upper[i] = '\0';
+  if (i < 4) return false;
+  if (upper[i - 4] != '.' || upper[i - 3] != 'M' || upper[i - 2] != 'P' || upper[i - 1] != '3') return false;
   if (strcmp(upper, TRIGGER_FILE) == 0) return false;
   if (strcmp(upper, IDLE_FILE) == 0) return false;
   return true;
 }
 
-// VS1053 player
-Adafruit_VS1053_FilePlayer musicPlayer = Adafruit_VS1053_FilePlayer(
-  MP3_CS, MP3_DCS, MP3_DREQ, SD_CS
-);
-
-unsigned long lastTriggerPrintMs = 0;
-
-// ---- Helper: measure one HC-SR04 safely ----
-float measureDistanceCm(uint8_t trigPin, uint8_t echoPin) {
+static inline float measureDistanceCm(uint8_t trigPin, uint8_t echoPin) {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  unsigned long duration = pulseIn(echoPin, HIGH, TIMEOUT_US);
+  unsigned long duration = pulseIn(echoPin, HIGH, SENSOR_TIMEOUT_US);
   if (duration == 0) return -1.0f;
 
-  float cm = duration * 0.034f / 2.0f;
-  if (cm <= 0.0f || cm > MAX_VALID_CM) return -1.0f;
-  if ((int)cm == 794) return -1.0f;
-  return cm;
+  float distance = duration * 0.0343f / 2.0f;
+  if (distance <= 0.0f || distance > MAX_VALID_DISTANCE_CM) return -1.0f;
+  return distance;
 }
 
-// ---- OUT_PIN control (flipped: idle LOW) ----
-bool outPinState = LOW;
-bool outPulseActive = false;
-unsigned long outPulseStartMs = 0;
-
-// ---- Arm pulse only after playback actually starts ----
-bool pulseArmed = false;
-unsigned long pulseArmStartMs = 0;
-
-void armOutPulseOnPlaybackStart() {
-  pulseArmed = true;
-  pulseArmStartMs = millis();
-  Serial.println(F("OUT pulse armed: waiting for playback start..."));
+static inline void logThrottled(const __FlashStringHelper *msg) {
+  unsigned long now = millis();
+  if (now - lastLogMs >= MIN_LOG_SPACING_MS) {
+    Serial.println(msg);
+    lastLogMs = now;
+  }
 }
 
-void servicePulseArm() {
-  if (!pulseArmed) return;
+// ---------------------------------------------------------------------------
+// OUT Pin / Pulse Handling
+// ---------------------------------------------------------------------------
+static void armOutPulseOnPlayback() {
+  outPulseArmed = true;
+  outPulseArmMs = millis();
+  Serial.println(F("OUT pulse armed; waiting for playback start"));
+}
 
+static void serviceOutPulseArm() {
+  if (!outPulseArmed) return;
   unsigned long now = millis();
   if (musicPlayer.playingMusic) {
     digitalWrite(OUT_PIN, HIGH);
     digitalWrite(OUT_PIN_MIRROR, HIGH);
-    outPinState = HIGH;
     outPulseActive = true;
     outPulseStartMs = now;
-    pulseArmed = false;
-    Serial.println(F("Playback started → OUT_PIN pulse: ON for 1s"));
-  } else if (now - pulseArmStartMs >= PULSE_ARM_TIMEOUT_MS) {
-    pulseArmed = false;
-    Serial.println(F("Playback did not start in time → skipping OUT pulse"));
+    outPulseArmed = false;
+    Serial.println(F("Playback detected → OUT pulse HIGH"));
+  } else if (now - outPulseArmMs >= OUT_ARM_TIMEOUT_MS) {
+    outPulseArmed = false;
+    Serial.println(F("Playback did not start → OUT pulse cancelled"));
   }
 }
 
-void serviceOutPulse() {
-  if (outPulseActive && (millis() - outPulseStartMs >= OUT_PULSE_MS)) {
+static void serviceOutPulse() {
+  if (!outPulseActive) return;
+  if (millis() - outPulseStartMs >= OUT_PULSE_WIDTH_MS) {
     digitalWrite(OUT_PIN, LOW);
     digitalWrite(OUT_PIN_MIRROR, LOW);
-    outPinState = LOW;
     outPulseActive = false;
-    Serial.println(F("OUT_PIN pulse: back OFF"));
+    Serial.println(F("OUT pulse complete → LOW"));
   }
 }
 
-void suspendIdlePlaybackForEvent() {
+// ---------------------------------------------------------------------------
+// Servo Helpers
+// ---------------------------------------------------------------------------
+static bool pressServo() {
+  unsigned long now = millis();
+  if (SERVO_COOLDOWN_MS > 0 && (now - lastServoPress) < SERVO_COOLDOWN_MS) {
+    unsigned long remain = SERVO_COOLDOWN_MS - (now - lastServoPress);
+    Serial.print(F("Servo cooldown "));
+    Serial.print(remain);
+    Serial.println(F(" ms remaining"));
+    return false;
+  }
+
+  lastServoPress = now;
+  servoActive = true;
+  servoStartMs = now;
+  triggerServo.write(SERVO_PRESS_DEG);
+  Serial.print(F("Servo press → "));
+  Serial.print(SERVO_PRESS_DEG);
+  Serial.println(F("°"));
+  return true;
+}
+
+static void serviceServo() {
+  if (!servoActive) return;
+  if (millis() - servoStartMs >= SERVO_HOLD_MS) {
+    servoActive = false;
+    triggerServo.write(SERVO_REST_DEG);
+    Serial.print(F("Servo rest → "));
+    Serial.print(SERVO_REST_DEG);
+    Serial.println(F("°"));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Idle Playback
+// ---------------------------------------------------------------------------
+static void suspendIdlePlayback() {
+  idleSuppressed = true;
+  idleLastAttemptMs = millis();
+
   if (idlePlaying) {
-    Serial.println(F("Idle: stopping IDLE.MP3 for trigger playback"));
+    Serial.println(F("Stopping idle track for trigger playback"));
     musicPlayer.stopPlaying();
     idlePlaying = false;
   }
-  idleSuppressed = true;
-  lastIdleStartMs = millis();
 }
 
-bool startIdlePlayback() {
-  if (!idleFileAvailable) return false;
+static bool startIdlePlayback(bool logErrors = true) {
+  if (!idleTrackAvailable) return false;
+  if (idleSuppressed) return false;
   if (musicPlayer.playingMusic) return false;
 
   if (musicPlayer.startPlayingFile(IDLE_FILE)) {
     idlePlaying = true;
-    lastIdleStartMs = millis();
-    Serial.println(F("Idle: playing IDLE.MP3"));
+    idleLastAttemptMs = millis();
+    Serial.println(F("Idle playback → IDLE.MP3"));
     return true;
   }
 
-  idleFileAvailable = false;
-  Serial.println(F("Idle: failed to play IDLE.MP3; disabling idle mode."));
+  idlePlaying = false;
+  if (logErrors) Serial.println(F("Failed to start IDLE.MP3 (disabling idle mode)"));
+  idleTrackAvailable = false;
   return false;
 }
 
-void serviceIdlePlayback() {
-  bool playing = musicPlayer.playingMusic;
+static void serviceIdlePlayback() {
+  unsigned long now = millis();
+  bool currentlyPlaying = musicPlayer.playingMusic;
 
-  if (!playing && idlePlaying) {
+  if (!currentlyPlaying && idlePlaying) {
     idlePlaying = false;
-    Serial.println(F("Idle: playback completed"));
+    Serial.println(F("Idle track finished"));
+    idleLastAttemptMs = now;
   }
 
-  if (!playing && idleSuppressed && !pulseArmed) {
+  if (!currentlyPlaying && idleSuppressed) {
     idleSuppressed = false;
-    Serial.println(F("Idle: trigger playback finished, resuming idle mode"));
+    idleLastAttemptMs = now;
+    Serial.println(F("Trigger playback finished → idle unlocked"));
   }
 
-  if (!playing && !idleSuppressed && idleFileAvailable && !idlePlaying) {
-    unsigned long now = millis();
-    if ((now - lastIdleStartMs) >= IDLE_INTERVAL_MS) {
+  if (!currentlyPlaying && !idlePlaying && idleTrackAvailable) {
+    if (now - idleLastAttemptMs >= IDLE_RETRY_INTERVAL_MS) {
       startIdlePlayback();
     }
   }
 }
 
-void refreshRandomTrackList() {
+// ---------------------------------------------------------------------------
+// Random Playlist Handling
+// ---------------------------------------------------------------------------
+static void shufflePlaylist() {
+  if (randomTrackCount <= 1) return;
+  for (int i = randomTrackCount - 1; i > 0; --i) {
+    int j = random(i + 1);
+    if (j == i) continue;
+    char tmp[13];
+    memcpy(tmp, randomTracks[i], sizeof(tmp));
+    memcpy(randomTracks[i], randomTracks[j], sizeof(tmp));
+    memcpy(randomTracks[j], tmp, sizeof(tmp));
+  }
+  if (randomTrackCount > 1) {
+    randomTrackIndex = random(randomTrackCount);
+  } else {
+    randomTrackIndex = 0;
+  }
+}
+
+static void refreshRandomPlaylist() {
+  randomTrackCount = 0;
+  randomTrackIndex = 0;
+
   File dir = SD.open("/", FILE_READ);
   if (!dir) {
-    Serial.println(F("Failed to open SD root while building playlist. Retrying..."));
-
-    if (!SD.begin(SD_CS)) {
-      Serial.println(F("SD reinit failed; leaving playlist unchanged."));
-      randomTrackCount = 0;
-      return;
-    }
-
-    dir = SD.open("/", FILE_READ);
-    if (!dir) {
-      Serial.println(F("Retry failed; random playlist unavailable."));
-      randomTrackCount = 0;
-      return;
-    }
+    Serial.println(F("Failed to open SD root for playlist build"));
+    return;
   }
 
-  uint8_t count = 0;
   while (true) {
     File entry = dir.openNextFile();
     if (!entry) break;
 
-    if (!entry.isDirectory() && isPlayableMp3(entry.name())) {
-      if (count < MAX_RANDOM_TRACKS) {
-        const char *entryName = entry.name();
-        uint8_t j = 0;
-        for (; entryName[j] != '\0' && j < 12; ++j) {
-          randomTracks[count][j] = entryName[j];
+    if (!entry.isDirectory()) {
+      const char *entryName = entry.name();
+      if (isPrintableMp3(entryName)) {
+        if (randomTrackCount < MAX_RANDOM_TRACKS) {
+          uint8_t j = 0;
+          for (; j < 12 && entryName[j] != '\0'; ++j) {
+            randomTracks[randomTrackCount][j] = entryName[j];
+          }
+          randomTracks[randomTrackCount][j] = '\0';
+          randomTrackCount++;
+        } else {
+          Serial.println(F("Playlist limit reached; additional tracks ignored"));
         }
-        randomTracks[count][j] = '\0';
-        count++;
-      } else {
-        Serial.println(F("Random playlist full; ignoring extra tracks."));
       }
     }
     entry.close();
   }
   dir.close();
 
-  randomTrackCount = count;
-  nextRandomIndex = 0;
-
-  if (randomTrackCount > 1) {
-    for (int i = randomTrackCount - 1; i > 0; --i) {
-      int j = random(i + 1);
-      if (j != i) {
-        char temp[13];
-        memcpy(temp, randomTracks[i], sizeof(temp));
-        memcpy(randomTracks[i], randomTracks[j], sizeof(temp));
-        memcpy(randomTracks[j], temp, sizeof(temp));
-      }
-    }
+  if (randomTrackCount == 0) {
+    Serial.println(F("No random tracks found on SD"));
+    return;
   }
 
-  if (randomTrackCount > 0) {
-    Serial.print(F("Random pool size: "));
-    Serial.println(randomTrackCount);
-  } else {
-    Serial.println(F("Random pool empty."));
-  }
+  shufflePlaylist();
+  Serial.print(F("Random playlist size: "));
+  Serial.println(randomTrackCount);
 }
 
-bool playRandomMp3() {
+static bool playNextRandomTrack() {
   if (randomTrackCount == 0) {
-    refreshRandomTrackList();
-  }
-
-  if (randomTrackCount == 0) {
-    Serial.println(F("No alternate MP3 files found on SD."));
-    return false;
-  }
-
-  const char *chosenName = randomTracks[nextRandomIndex];
-  nextRandomIndex++;
-  if (nextRandomIndex >= randomTrackCount) {
-    nextRandomIndex = 0;
-  }
-
-  if (chosenName[0] == '\0') {
-    Serial.println(F("Random playlist entry empty; refreshing list."));
-    refreshRandomTrackList();
+    refreshRandomPlaylist();
     if (randomTrackCount == 0) return false;
-    chosenName = randomTracks[nextRandomIndex];
-    nextRandomIndex = (nextRandomIndex + 1) % randomTrackCount;
   }
 
-  Serial.print(F("Random MP3 selected: "));
-  Serial.println(chosenName);
+  const char *track = randomTracks[randomTrackIndex];
+  randomTrackIndex = (randomTrackIndex + 1) % randomTrackCount;
 
-  if (!musicPlayer.startPlayingFile(chosenName)) {
-    Serial.println(F("Failed to start selected random MP3."));
+  Serial.print(F("Playing random track: "));
+  Serial.println(track);
+
+  if (!musicPlayer.startPlayingFile(track)) {
+    Serial.println(F("Failed to play selected random track"));
     return false;
   }
-
-  Serial.println(F("Playing random MP3 fallback."));
   return true;
 }
 
-bool playTriggerOrRandom() {
-  suspendIdlePlaybackForEvent();
+// ---------------------------------------------------------------------------
+// Trigger Playback
+// ---------------------------------------------------------------------------
+static bool playTriggerOrRandom() {
+  suspendIdlePlayback();
 
-  if (triggerFileAvailable) {
+  if (triggerTrackAvailable) {
     if (musicPlayer.startPlayingFile(TRIGGER_FILE)) {
-      Serial.println(F("Starting TRIGGER.MP3"));
-      armOutPulseOnPlaybackStart();
+      Serial.println(F("Playing TRIGGER.MP3"));
+      armOutPulseOnPlayback();
       return true;
     }
-    Serial.println(F("Failed to play TRIGGER.MP3, falling back to random MP3."));
-    triggerFileAvailable = false;
+    Serial.println(F("Failed to play TRIGGER.MP3 → using random track"));
+    triggerTrackAvailable = false;
   }
 
-  if (playRandomMp3()) {
-    armOutPulseOnPlaybackStart();
+  if (playNextRandomTrack()) {
+    armOutPulseOnPlayback();
     return true;
   }
 
+  Serial.println(F("No audio available for trigger"));
   idleSuppressed = false;
   return false;
 }
 
-// ---- Servo helpers ----
-bool triggerServoMove() {
+// ---------------------------------------------------------------------------
+// Sensor Handling
+// ---------------------------------------------------------------------------
+static void handleSensors() {
   unsigned long now = millis();
+  if (now - lastSampleMs < SENSOR_PING_GAP_MS) return;
+  lastSampleMs = now;
 
-  // Enforce cooldown
-  if (now - lastServoMoveMs < SERVO_COOLDOWN_MS) {
-    unsigned long remain = SERVO_COOLDOWN_MS - (now - lastServoMoveMs);
-    Serial.print(F("Servo: cooldown active, "));
-    Serial.print(remain);
-    Serial.println(F(" ms remaining"));
-    return false; // block this trigger
+  lastDistance1 = measureDistanceCm(TRIG1_PIN, ECHO1_PIN);
+  delayMicroseconds(1500);
+  lastDistance2 = measureDistanceCm(TRIG2_PIN, ECHO2_PIN);
+
+  bool reading1InRange = (lastDistance1 > 0 && lastDistance1 <= TRIGGER_DISTANCE_CM);
+  bool reading2InRange = (lastDistance2 > 0 && lastDistance2 <= TRIGGER_DISTANCE_CM);
+  bool anyInRange = reading1InRange || reading2InRange;
+
+  bool reading1Out = (lastDistance1 < 0) || (lastDistance1 >= TRIGGER_DISTANCE_CM + RELEASE_MARGIN_CM);
+  bool reading2Out = (lastDistance2 < 0) || (lastDistance2 >= TRIGGER_DISTANCE_CM + RELEASE_MARGIN_CM);
+  bool bothOut = reading1Out && reading2Out;
+
+  if (anyInRange) {
+    if (inRangeStreak < 255) inRangeStreak++;
+    releaseStreak = 0;
+  } else {
+    inRangeStreak = 0;
+    if (bothOut) {
+      if (releaseStreak < 255) releaseStreak++;
+    } else {
+      releaseStreak = 0;
+    }
   }
 
-  // Allow the move and start a new cooldown window
-  lastServoMoveMs = now;
+  if (!triggerLatched && inRangeStreak >= TRIGGER_CONFIRMATIONS) {
+    triggerLatched = true;
+    Serial.println(F("Trigger edge detected"));
+    digitalWrite(LED_BUILTIN, HIGH);
 
-  // Move to "pressed" position
-  triggerServo.write(SERVO_MIN);
-  servoActive = true;
-  servoStartMs = now;
-  Serial.println("Servo: move to " + String(SERVO_MIN) + "° (pressed)");
+    bool servoFired = pressServo();
+    if (servoFired && (!musicPlayer.playingMusic || idlePlaying)) {
+      if (!playTriggerOrRandom()) {
+        Serial.println(F("Trigger fired but no track available"));
+      }
+    }
+  }
 
-  return true;
-}
-
-void serviceServo() {
-  // After holding for SERVO_HOLD_MS, return to "rest" position
-  if (servoActive && (millis() - servoStartMs >= SERVO_HOLD_MS)) {
-    triggerServo.write(SERVO_MAX);
-    servoActive = false;
-    Serial.println("Servo: back to " + String(SERVO_MAX) + "° (rest)");
+  if (triggerLatched && releaseStreak >= RELEASE_CONFIRMATIONS) {
+    triggerLatched = false;
+    digitalWrite(LED_BUILTIN, LOW);
+    Serial.println(F("Trigger re-armed"));
   }
 }
 
+// ---------------------------------------------------------------------------
+// Serial Debug Trigger
+// ---------------------------------------------------------------------------
+static void handleSerialTrigger() {
+  if (!debugMode) return;
+  if (!Serial.available()) return;
+
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+  if (input.length() > 0) return;
+
+  Serial.println(F("Debug trigger via serial"));
+  bool servoFired = pressServo();
+  if (servoFired && (!musicPlayer.playingMusic || idlePlaying)) {
+    if (!playTriggerOrRandom()) {
+      Serial.println(F("Debug trigger: no audio available"));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Setup & Loop
+// ---------------------------------------------------------------------------
 void setup() {
-  randomSeed(analogRead(A3) ^ analogRead(A4) ^ analogRead(A5));
+  randomSeed(analogRead(A0) ^ analogRead(A1) ^ micros());
 
-  // OUT pin + LED
   pinMode(OUT_PIN, OUTPUT);
   pinMode(OUT_PIN_MIRROR, OUTPUT);
-  digitalWrite(OUT_PIN, outPinState);   // start OFF (LOW)
+  digitalWrite(OUT_PIN, outPinState);
   digitalWrite(OUT_PIN_MIRROR, outPinState);
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
-  // Serial
-  Serial.begin(9600);
-  Serial.println(F("Ready. Pulsing OUT only after audio playback actually starts."));
-
-  // Ultrasonic
   pinMode(TRIG1_PIN, OUTPUT);
   pinMode(ECHO1_PIN, INPUT);
   pinMode(TRIG2_PIN, OUTPUT);
   pinMode(ECHO2_PIN, INPUT);
 
-  // Servo
-  // Note: On ATmega328P boards the Servo library uses Timer1.
-  // Using D10 is fine here. It also keeps hardware SS as OUTPUT for SPI stability.
   triggerServo.attach(SERVO_PIN);
-  triggerServo.write(50);  // Start at 50° on boot
-  Serial.println(F("Servo initialized to 50°"));
+  triggerServo.write(SERVO_REST_DEG);
+  Serial.begin(9600);
+  Serial.println(F("System booting..."));
+  Serial.print(F("Servo rest angle → "));
+  Serial.print(SERVO_REST_DEG);
+  Serial.println(F("°"));
 
-
-  // Audio
   if (!musicPlayer.begin()) {
-    Serial.println(F("VS1053 not found. Check wiring/shield."));
-    while (1) { delay(10); }
+    Serial.println(F("VS1053 not found; check wiring"));
+    while (true) delay(20);
   }
+
   if (!SD.begin(SD_CS)) {
-    Serial.println(F("SD init failed. Check card/format/CS pin."));
-    while (1) { delay(10); }
+    Serial.println(F("SD init failed; check card or wiring"));
+    while (true) delay(20);
   }
+
   musicPlayer.setVolume(20, 20);
   musicPlayer.useInterrupt(VS1053_FILEPLAYER_PIN_INT);
-  Serial.println(F("Music Maker ready."));
+  Serial.println(F("Music Maker ready"));
 
-  triggerFileAvailable = SD.exists(TRIGGER_FILE);
-  if (triggerFileAvailable) {
-    Serial.println(F("TRIGGER.MP3 detected on SD."));
-  } else {
-    Serial.println(F("TRIGGER.MP3 not found. Random MP3 fallback enabled."));
-  }
+  triggerTrackAvailable = SD.exists(TRIGGER_FILE);
+  Serial.println(triggerTrackAvailable ? F("TRIGGER.MP3 detected") : F("TRIGGER.MP3 missing → using random tracks"));
 
-  idleFileAvailable = SD.exists(IDLE_FILE);
-  if (idleFileAvailable) {
-    Serial.println(F("IDLE.MP3 detected. Idle playback enabled."));
-  } else {
-    Serial.println(F("IDLE.MP3 not found. Idle playback disabled."));
-  }
+  idleTrackAvailable = SD.exists(IDLE_FILE);
+  Serial.println(idleTrackAvailable ? F("IDLE.MP3 detected") : F("IDLE.MP3 missing"));
 
-  refreshRandomTrackList();
+  refreshRandomPlaylist();
 
-  if (idleFileAvailable) {
-    lastIdleStartMs = millis() - IDLE_INTERVAL_MS;  // allow immediate first play
+  if (idleTrackAvailable) {
+    idleSuppressed = false;
+    idleLastAttemptMs = millis() - IDLE_RETRY_INTERVAL_MS;
     startIdlePlayback();
   }
 }
 
-void handleSensors() {
-  static unsigned long lastPingMs = 0;
-  static float d1 = -1.0f, d2 = -1.0f;
-  static uint8_t inRangeStreak = 0;
-  static unsigned long inRangeStartMs = 0;
-  static uint8_t outOfRangeStreak = 0;
-  static bool wasInRange = false;
-
-  unsigned long now = millis();
-  if (now - lastPingMs >= PING_GAP_MS) {
-    d1 = measureDistanceCm(TRIG1_PIN, ECHO1_PIN);
-    delayMicroseconds(1500);
-    d2 = measureDistanceCm(TRIG2_PIN, ECHO2_PIN);
-    lastPingMs = now;
-  }
-
-  bool inRange = ( (d1 > 0 && d1 < TRIGGER_CM) || (d2 > 0 && d2 < TRIGGER_CM) );
-  float releaseThreshold = TRIGGER_CM + TRIGGER_RELEASE_MARGIN_CM;
-  bool withinReleaseBand = (
-    (d1 > 0 && d1 < releaseThreshold) ||
-    (d2 > 0 && d2 < releaseThreshold)
-  );
-  bool fullyOut = !withinReleaseBand;
-
-  if (inRange) {
-    if (inRangeStreak < TRIGGER_CONFIRMATIONS) {
-      inRangeStreak++;
-    }
-    if (inRangeStartMs == 0) {
-      inRangeStartMs = now;
-    }
-    outOfRangeStreak = 0;
-  } else {
-    inRangeStreak = 0;
-    inRangeStartMs = 0;
-    if (fullyOut) {
-      if (outOfRangeStreak < TRIGGER_RELEASE_CONFIRMATIONS) {
-        outOfRangeStreak++;
-      }
-    } else {
-      outOfRangeStreak = 0;
-    }
-  }
-
-  bool holdSatisfied = (TRIGGER_HOLD_MS == 0UL) ? true : ((inRangeStartMs != 0) && ((now - inRangeStartMs) >= TRIGGER_HOLD_MS));
-  bool confirmedRange = (inRangeStreak >= TRIGGER_CONFIRMATIONS) && holdSatisfied;
-  bool nextWasInRange = wasInRange;
-
-  if (confirmedRange && !wasInRange && (now - lastTriggerPrintMs >= MUTE_INTERVAL_MS)) {
-    Serial.println(F("TRIGGERED (edge)"));
-    digitalWrite(LED_BUILTIN, HIGH);
-
-    // Kick the servo immediately on edge
-    bool servoTriggered = triggerServoMove();
-
-    if (servoTriggered && (!musicPlayer.playingMusic || idlePlaying)) {
-      if (!playTriggerOrRandom()) {
-        Serial.println(F("No audio track could be started."));
-      }
-    } else if (!servoTriggered) {
-      // Servo still cooling; skip audio to avoid rapid retriggers
-    } else {
-      Serial.println(F("Already playing, skipping OUT pulse to keep sync"));
-    }
-    lastTriggerPrintMs = now;
-    nextWasInRange = true;
-  } else if (!confirmedRange && wasInRange) {
-    if (outOfRangeStreak >= TRIGGER_RELEASE_CONFIRMATIONS) {
-      nextWasInRange = false;
-    }
-  }
-
-  digitalWrite(LED_BUILTIN, nextWasInRange ? HIGH : LOW);
-  wasInRange = nextWasInRange;
-
-  if (!confirmedRange && !wasInRange) {
-    outOfRangeStreak = 0;  // reset streak once fully disarmed
-  }
-}
-
-void handleSerialTrigger() {
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');  // read until newline
-
-    // Trim whitespace (useful if Serial Monitor sends \r\n)
-    input.trim();
-
-    // If the input line is empty, trigger manually
-    if (input.length() == 0 && debugMode) {
-      Serial.println(F("Serial trigger received (empty line)"));
-
-      // Kick the servo
-      bool servoTriggered = triggerServoMove();
-
-      // Play TRIGGER.MP3 if not already playing
-      if (servoTriggered && (!musicPlayer.playingMusic || idlePlaying)) {
-        if (!playTriggerOrRandom()) {
-          Serial.println(F("Serial trigger: no audio track available."));
-        }
-      } else if (!servoTriggered) {
-        // Servo still cooling; skip audio
-      } else {
-        Serial.println(F("Already playing, skipping OUT pulse to keep sync"));
-      }
-    }
-  }
-}
-
-
 void loop() {
-  handleSensors();              // ultrasonic triggers
-  servicePulseArm();            // fire OUT pulse when playback actually starts
-  serviceOutPulse();            // end the 1s OUT pulse
-  serviceServo();               // return servo to 0° after hold
-  handleSerialTrigger();        // listen for empty-line triggers
-  serviceIdlePlayback();        // keep IDLE.MP3 running when nothing else is
-  delay(10);
+  handleSensors();
+  serviceOutPulseArm();
+  serviceOutPulse();
+  serviceServo();
+  handleSerialTrigger();
+  serviceIdlePlayback();
+  delay(LOOP_DELAY_MS);
 }
